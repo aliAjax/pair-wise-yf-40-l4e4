@@ -4,6 +4,9 @@ from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
 from .rules import RuleEngine
 
+BLOCKABLE_STATUSES = ("declared", "inspected")
+RESOLVED_STATUSES = ("inspected", "released", "destroyed")
+
 
 class DomainService:
     def __init__(self, repository, rules=None):
@@ -56,7 +59,139 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if updated["kind"] == "consignment":
+            if updated["status"] == "quarantined":
+                self._block_descendants(actor, updated)
+            elif updated["status"] in RESOLVED_STATUSES:
+                self._restore_descendants(actor, updated)
         return updated
+
+    def _descendants(self, root_id):
+        """BFS over the consignment source chain, nearest level first."""
+        children = {}
+        for item in self.repository.list_entities(kind="consignment"):
+            parent_id = item["data"].get("parent_id")
+            if parent_id:
+                children.setdefault(parent_id, []).append(item)
+        result = []
+        queue = list(children.get(root_id, []))
+        seen = {root_id}
+        while queue:
+            node = queue.pop(0)
+            if node["id"] in seen:
+                continue
+            seen.add(node["id"])
+            result.append(node)
+            queue.extend(children.get(node["id"], []))
+        return result
+
+    def _block_descendants(self, actor, source):
+        source_code = source["data"].get("code", source["id"])
+        reason = "source batch %s quarantined" % source_code
+        for desc in self._descendants(source["id"]):
+            if desc["status"] not in BLOCKABLE_STATUSES:
+                continue
+            merged = dict(desc["data"])
+            merged.update(
+                {
+                    "pre_block_status": desc["status"],
+                    "blocked_by": source["id"],
+                    "blocked_by_code": source_code,
+                    "block_reason": reason,
+                }
+            )
+            self.repository.update_entity(
+                desc["id"], desc["version"], "pending_review", merged
+            )
+            self.audit.record(
+                desc["id"],
+                actor,
+                "block",
+                desc["status"],
+                "pending_review",
+                {
+                    "blocked_by": source["id"],
+                    "blocked_by_code": source_code,
+                    "reason": reason,
+                },
+            )
+
+    def _active_blocker(self, entity):
+        """Nearest ancestor that still requires this batch to stay pending."""
+        seen = {entity["id"]}
+        current = entity
+        while True:
+            parent_id = current["data"].get("parent_id")
+            if not parent_id or parent_id in seen:
+                return None
+            seen.add(parent_id)
+            parent = self.repository.get_entity(parent_id)
+            if not parent:
+                return None
+            if parent["status"] == "quarantined":
+                return parent
+            if parent["status"] == "pending_review":
+                blocked_by = parent["data"].get("blocked_by")
+                if blocked_by and blocked_by not in seen:
+                    blocker = self.repository.get_entity(blocked_by)
+                    if blocker:
+                        return blocker
+                return parent
+            current = parent
+
+    def _restore_descendants(self, actor, source):
+        source_code = source["data"].get("code", source["id"])
+        for desc in self._descendants(source["id"]):
+            if desc["status"] != "pending_review":
+                continue
+            if desc["data"].get("blocked_by") != source["id"]:
+                continue
+            blocker = self._active_blocker(desc)
+            if blocker:
+                blocker_code = blocker["data"].get("code", blocker["id"])
+                reason = "source batch %s quarantined" % blocker_code
+                merged = dict(desc["data"])
+                merged.update(
+                    {
+                        "blocked_by": blocker["id"],
+                        "blocked_by_code": blocker_code,
+                        "block_reason": reason,
+                    }
+                )
+                self.repository.update_entity(
+                    desc["id"], desc["version"], "pending_review", merged
+                )
+                self.audit.record(
+                    desc["id"],
+                    actor,
+                    "reblock",
+                    "pending_review",
+                    "pending_review",
+                    {
+                        "blocked_by": blocker["id"],
+                        "blocked_by_code": blocker_code,
+                        "reason": reason,
+                    },
+                )
+                continue
+            merged = dict(desc["data"])
+            target = merged.pop("pre_block_status", "declared")
+            for key in ("blocked_by", "blocked_by_code", "block_reason"):
+                merged.pop(key, None)
+            self.repository.update_entity(desc["id"], desc["version"], target, merged)
+            self.audit.record(
+                desc["id"],
+                actor,
+                "restore",
+                "pending_review",
+                target,
+                {
+                    "reason": "blocking source %s resolved (%s)"
+                    % (source_code, source["status"]),
+                    "source": source["id"],
+                    "restored_to": target,
+                },
+            )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

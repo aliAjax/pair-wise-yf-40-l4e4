@@ -11,6 +11,24 @@ from .domain import (
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
         raise ValidationError("origin and destination must differ")
+    parent_id = data.get("parent_id")
+    if parent_id:
+        if parent_id == data.get("id"):
+            raise ValidationError("parent_id must not reference the consignment itself")
+        parent = _find_one(lookup, "consignment", "id", parent_id)
+        if not parent:
+            raise ValidationError("parent consignment not found: " + str(parent_id))
+        # walk up the source chain to reject cycles
+        seen = {data.get("id"), parent_id}
+        current = parent
+        while current:
+            next_id = (current.get("data") or {}).get("parent_id")
+            if not next_id:
+                break
+            if next_id in seen:
+                raise ValidationError("parent_id would create a source cycle")
+            seen.add(next_id)
+            current = _find_one(lookup, "consignment", "id", next_id)
 
 
 def _validate_quarantine(actor, entity, data, lookup):
@@ -50,7 +68,7 @@ CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('con
 class RuleEngine:
     ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
     INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected', 'pending_review'), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
     CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
     ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
     CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
