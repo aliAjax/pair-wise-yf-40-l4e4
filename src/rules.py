@@ -8,9 +8,20 @@ from .domain import (
 )
 
 
+PENDING_REVIEW = "pending_review"
+BLOCKABLE_STATUSES = ("declared", "inspected", "released")
+HELD_STATUSES = ("quarantined", PENDING_REVIEW)
+
+
 def _validate_consignment(actor, data, lookup):
     if data.get("origin") == data.get("destination"):
         raise ValidationError("origin and destination must differ")
+    parent_id = data.get("parent_id")
+    if parent_id:
+        if data.get("id") and parent_id == data.get("id"):
+            raise ValidationError("parent_id cannot reference the consignment itself")
+        if lookup is not None and not _find_one(lookup, "consignment", "id", parent_id):
+            raise ValidationError("parent consignment not found: " + str(parent_id))
 
 
 def _validate_quarantine(actor, entity, data, lookup):

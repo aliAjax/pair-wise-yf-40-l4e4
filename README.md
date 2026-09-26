@@ -26,6 +26,15 @@ python3 app.py --db ./data.db --port 8306
 
 - `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
 
+## 传播链阻断
+
+- 申报批次时可通过`parent_id`登记直接来源批次（必须已存在，且不能是自身）。
+- 来源批次被隔离（`quarantine`）后，其全部下游批次自动转入`pending_review`（待复核），并在`blocked_by`中显示阻断批次；待复核期间不允许任何动作。
+- 源头解除隔离（`release`）或销毁（`destroy`）后，下游批次沿传播链逐级恢复到阻断前状态；中间层仍未解除时，其以下层级保持待复核。
+- 任何一层复检再次阳性被隔离，已恢复的后代批次重新转入待复核。
+- 在被阻断的来源下申报新批次，新批次直接以待复核状态登记。
+- 每次阻断与恢复都写入审计时间线，包含阻断原因、处理人和时间。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
@@ -33,6 +42,7 @@ python3 app.py --db ./data.db --port 8306
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/entities/<id>/audit`：读取单对象时间线。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
